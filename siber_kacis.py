@@ -2,18 +2,20 @@
 SİBER KAÇIŞ  -  Neo-İstanbul, 2147
 Geleceğin şehrinde robotlarla savaş, görevleri tamamla ve sistemi kurtar.
 
-
+SES: Tüm sesler ve müzik oyun açılırken kodla üretilir (ekstra dosya / kütüphane gerekmez).
 
 KONTROLLER
   WASD / Ok tuşları : hareket          Fare : nişan al
   Sol tık (basılı)  : ateş             SPACE : atılma / dash (hasar almazsın)
   1 / 2 / 3 / tekerlek : silah değiştir
   E (basılı tut)    : terminal hackle  ESC / P : duraklat
+  N                 : sesi aç / kapat
 """
 import math
 import os
 import random
 import sys
+from array import array
 
 import pygame
 from pygame import Vector2 as Vek   # Vek(x, y): konum / hız gibi iki boyutlu vektör
@@ -26,6 +28,7 @@ SOKAK_X = [600, 1100, 1600, 2100]      # dikey sokakların orta çizgisi (x)
 SOKAK_Y = [500, 920, 1340]             # yatay sokakların orta çizgisi (y)
 ASANSOR_KONUM = Vek(2100, 1340)        # kaçış asansörünün dünyadaki yeri
 
+pygame.mixer.pre_init(22050, -16, 1, 512)   # ses sistemi ayarı (pygame.init'ten ÖNCE olmalı)
 pygame.init()
 ekran = pygame.display.set_mode((GENISLIK, YUKSEKLIK))   # gerçek pencere
 pygame.display.set_caption("SİBER KAÇIŞ")
@@ -65,6 +68,215 @@ DUSMAN_OZELLIKLERI = {   # tür: (can, sürat, yarıçap, renk, öldürünce pua
     "agir": (170, 58, 26, MOR, 300),
     "patron": (900, 75, 54, PEMBE, 3000),
 }
+
+
+# ----------------------------------------------------------------- ses sistemi
+class Ses:
+    """Tüm ses efektlerini ve arka plan müziğini kodla üretir ve çalar.
+    Ses kartı yoksa ya da ses açılamazsa oyun sessiz şekilde sorunsuz çalışmaya devam eder."""
+
+    # efekt adı -> aynı efektin art arda çalınabilmesi için en kısa aralık (saniye)
+    BEKLEME = {"vurus": 0.05, "dusman_ates": 0.07, "patlama": 0.07, "buyuk_patlama": 0.3,
+               "hackle": 0.1, "halka": 0.12, "hasar": 0.1, "esya": 0.08, "silah": 0.05}
+
+    def __init__(self):
+        self.acik = False                  # ses sistemi çalışıyor mu?
+        self.sessiz = False                # oyuncu N ile kapattı mı?
+        self.sesler, self.son_calma = {}, {}
+        self.muzik, self.muzik_kanali, self.muzik_seviye = None, None, 0.35
+        self.hiz, self.kanal = 22050, 1
+        try:
+            ayar = pygame.mixer.get_init()
+            if not ayar:
+                pygame.mixer.init(22050, -16, 1, 512)
+                ayar = pygame.mixer.get_init()
+            if not ayar or ayar[1] != -16:     # sadece 16 bit işaretli formatı destekliyoruz
+                return
+            self.hiz, _, self.kanal = ayar
+            pygame.mixer.set_num_channels(24)
+            pygame.mixer.set_reserved(1)       # 0. kanal sadece müzik için ayrıldı
+            self.efektleri_uret()
+            self.muzik = self.muzik_uret()
+            self.muzik_kanali = pygame.mixer.Channel(0)
+            self.acik = True
+        except Exception as hata:
+            print("Ses başlatılamadı, oyun sessiz çalışacak:", hata)
+            self.acik = False
+
+    # --- ses sentezi
+    def _ton(self, sure, f0, f1=None, dalga="kare", gurultu=0.0, guc=2.0, ses=0.5, filtre=1.0):
+        """Tek bir ses parçası üretir (örnek listesi döner).
+        f0 -> f1: başlangıç ve bitiş frekansı (kayan ses), dalga: kare/testere/ucgen/sinus,
+        gurultu: 0-1 arası beyaz gürültü karışımı, guc: sönme hızı, filtre: küçük değer = boğuk ses."""
+        f1 = f0 if f1 is None else f1
+        n = max(1, int(sure * self.hiz))
+        atak = max(1, int(0.004 * self.hiz))          # patlamasın diye 4 ms yumuşak başlangıç
+        faz, y, cikti = 0.0, 0.0, []
+        for i in range(n):
+            k = i / n
+            f = f0 * (f1 / f0) ** k
+            faz = (faz + f / self.hiz) % 1.0
+            if dalga == "kare":
+                s = 1.0 if faz < 0.5 else -1.0
+            elif dalga == "testere":
+                s = 2 * faz - 1
+            elif dalga == "ucgen":
+                s = 4 * abs(faz - 0.5) - 1
+            else:
+                s = math.sin(math.tau * faz)
+            if gurultu:
+                s = s * (1 - gurultu) + random.uniform(-1, 1) * gurultu
+            y += filtre * (s - y)
+            zarf = min(1.0, i / atak) * (1 - k) ** guc
+            cikti.append(y * zarf * ses)
+        return cikti
+
+    def _miks(self, toplam, parcalar, dongu=False):
+        """(başlangıç sn, örnekler) çiftlerini tek bir listede üst üste bindirir."""
+        n = int(toplam * self.hiz)
+        tampon = [0.0] * n
+        for bas, veri in parcalar:
+            b = int(bas * self.hiz)
+            for i, v in enumerate(veri):
+                j = b + i
+                if j >= n:
+                    if not dongu:
+                        break
+                    j %= n
+                tampon[j] += v
+        return tampon
+
+    def _sese_cevir(self, tampon, seviye=1.0):
+        """Örnek listesini en yüksek noktası sınırın altında kalacak şekilde pygame Sound'a çevirir."""
+        en_buyuk = max(1e-6, max(abs(v) for v in tampon))
+        k = 0.9 / en_buyuk
+        veri = array("h", [int(max(-1.0, min(1.0, v * k)) * 32767) for v in tampon])
+        if self.kanal == 2:                           # stereo açılmışsa her örneği iki kez yaz
+            stereo = array("h")
+            for v in veri:
+                stereo.append(v)
+                stereo.append(v)
+            veri = stereo
+        sesim = pygame.mixer.Sound(buffer=veri.tobytes())
+        sesim.set_volume(seviye)
+        return sesim
+
+    def _arpej(self, notalar, aralik, dalga="ucgen", sure=0.2, ses=0.5):
+        """Notaları (Hz) peş peşe, birbirine karışarak çalan kısa melodi."""
+        toplam = aralik * len(notalar) + sure
+        return self._miks(toplam, [(i * aralik, self._ton(sure, f, f, dalga, 0, 1.3, ses, 0.7))
+                                   for i, f in enumerate(notalar)])
+
+    def efektleri_uret(self):
+        """Oyundaki bütün ses efektlerini üretir ve 'sesler' sözlüğüne koyar."""
+        t, m = self._ton, self._miks
+        yap = {
+            "plazma": (t(0.14, 1100, 180, "kare", 0.05, 2.0, 0.6, 0.6), 0.30),
+            "sacma": (m(0.3, [(0, t(0.28, 220, 60, "testere", 0.9, 1.5, 1.0, 0.35)),
+                              (0, t(0.2, 150, 45, "sinus", 0, 1.5, 0.9))]), 0.55),
+            "lazer": (t(0.07, 2200, 900, "testere", 0.0, 1.0, 0.6, 0.5), 0.18),
+            "dusman_ates": (t(0.13, 620, 200, "ucgen", 0.12, 1.5, 0.7, 0.8), 0.22),
+            "vurus": (t(0.05, 900, 500, "kare", 0.5, 2.0, 0.6, 0.8), 0.18),
+            "patlama": (m(0.55, [(0, t(0.5, 1, 1, "kare", 1.0, 2.0, 1.0, 0.12)),
+                                 (0, t(0.4, 100, 35, "sinus", 0, 1.5, 0.9))]), 0.55),
+            "buyuk_patlama": (m(1.4, [(0, t(1.3, 1, 1, "kare", 1.0, 1.8, 1.0, 0.07)),
+                                      (0, t(1.0, 80, 25, "sinus", 0, 1.3, 1.0)),
+                                      (0.05, t(0.5, 400, 60, "testere", 0.3, 2.0, 0.5, 0.2))]), 0.75),
+            "hasar": (m(0.3, [(0, t(0.25, 240, 70, "kare", 0.4, 1.5, 1.0, 0.4)),
+                              (0, t(0.2, 90, 40, "sinus", 0, 1.5, 1.0))]), 0.55),
+            "dash": (t(0.2, 300, 2000, "testere", 0.35, 1.0, 0.8, 0.3), 0.30),
+            "esya": (self._arpej([660, 880, 1320], 0.06, "ucgen", 0.12, 0.6), 0.35),
+            "hackle": (t(0.05, 1500, 1700, "kare", 0, 1.5, 0.6, 0.5), 0.14),
+            "terminal_tamam": (self._arpej([523, 659, 784, 1047], 0.09, "ucgen", 0.35, 0.6), 0.45),
+            "gorev": (self._arpej([523, 659, 784, 1047, 1319], 0.11, "kare", 0.6, 0.4), 0.45),
+            "patron_uyan": (m(2.0, [(0, t(1.9, 55, 40, "testere", 0.1, 0.8, 1.0, 0.2)),
+                                    (0, t(1.9, 110, 70, "kare", 0, 0.8, 0.5, 0.2)),
+                                    (0.4, t(1.2, 900, 120, "testere", 0.3, 1.2, 0.3, 0.3))]), 0.65),
+            "halka": (m(0.4, [(0, t(0.35, 220, 60, "sinus", 0, 1.2, 1.0)),
+                              (0, t(0.3, 900, 200, "kare", 0.2, 1.5, 0.4, 0.5))]), 0.35),
+            "zafer": (self._arpej([523, 659, 784, 1047, 784, 1047, 1319, 1568], 0.14, "kare", 0.9, 0.4), 0.55),
+            "yenilgi": (self._arpej([392, 330, 262, 196], 0.32, "testere", 0.8, 0.5), 0.55),
+            "baslat": (t(0.3, 300, 1400, "kare", 0, 1.0, 0.6, 0.6), 0.35),
+            "duraklat": (t(0.1, 700, 500, "ucgen", 0, 1.0, 0.7), 0.30),
+            "silah": (t(0.06, 1000, 1400, "ucgen", 0, 1.0, 0.7), 0.25),
+        }
+        for isim, (tampon, seviye) in yap.items():
+            self.sesler[isim] = self._sese_cevir(tampon, seviye)
+
+    def muzik_uret(self):
+        """Am - F - C - G akor dizisi üzerinde, kendini tekrar eden synthwave tarzı bir müzik üretir."""
+        tempo = 104
+        vurus = 60 / tempo                     # bir vuruşun süresi (sn)
+        adim = vurus / 4                       # 16'lık nota
+        olcu = vurus * 4
+        toplam = olcu * 4
+        nota = lambda midi: 440 * 2 ** ((midi - 69) / 12)   # MIDI nota numarasından frekansa
+        basslar = [45, 41, 48, 43]                          # A2, F2, C3, G2
+        akorlar = [[57, 60, 64, 69], [53, 57, 60, 65], [60, 64, 67, 72], [55, 59, 62, 67]]
+        desen = [0, 2, 1, 3, 2, 3, 1, 2]                    # arpej sırası
+        onbellek = {}
+
+        def parca(*arg):                                    # aynı sesi tekrar tekrar üretmemek için sakla
+            if arg not in onbellek:
+                onbellek[arg] = self._ton(*arg)
+            return onbellek[arg]
+
+        parcalar = []
+        for o in range(4):
+            bas_f = nota(basslar[o])
+            for s in range(16):
+                zaman = o * olcu + s * adim
+                if s % 4 == 0:                              # bas davul
+                    parcalar.append((zaman, parca(0.2, 130, 45, "sinus", 0, 1.5, 1.0, 1.0)))
+                if s in (4, 12):                            # trampet
+                    parcalar.append((zaman, parca(0.13, 1, 1, "kare", 1.0, 1.5, 0.5, 0.5)))
+                if s % 4 == 2:                              # hi-hat
+                    parcalar.append((zaman, parca(0.04, 1, 1, "kare", 1.0, 2.0, 0.22, 0.9)))
+                if s % 2 == 0:                              # bas gitar
+                    parcalar.append((zaman, parca(adim * 1.8, bas_f, bas_f, "testere", 0, 1.0, 0.55, 0.15)))
+                f = nota(akorlar[o][desen[s % 8]])          # arpej
+                parcalar.append((zaman, parca(adim * 1.6, f, f, "kare", 0, 2.0, 0.16, 0.5)))
+        return self._sese_cevir(self._miks(toplam, parcalar, dongu=True))
+
+    # --- çalma
+    def cal(self, isim, bekleme=None):
+        """Efekti çalar. 'bekleme': aynı efektin tekrar çalınabilmesi için gereken en kısa süre (sn)."""
+        if not self.acik or self.sessiz:
+            return
+        sesim = self.sesler.get(isim)
+        if sesim is None:
+            return
+        aralik = self.BEKLEME.get(isim, 0.0) if bekleme is None else bekleme
+        simdi = pygame.time.get_ticks()
+        if simdi - self.son_calma.get(isim, -10000) < aralik * 1000:
+            return
+        self.son_calma[isim] = simdi
+        sesim.play()
+
+    def muzik_baslat(self):
+        """Müziği sonsuz döngüde başlatır."""
+        if self.acik and self.muzik_kanali:
+            self.muzik_kanali.play(self.muzik, loops=-1)
+            self.muzik_seviye_ayarla(self.muzik_seviye)
+
+    def muzik_seviye_ayarla(self, seviye):
+        """Müziğin sesini ayarlar (sessiz moddaysa 0 kalır)."""
+        self.muzik_seviye = seviye
+        if self.acik and self.muzik_kanali:
+            self.muzik_kanali.set_volume(0.0 if self.sessiz else seviye)
+
+    def sesi_ac_kapat(self):
+        """N tuşu: bütün sesleri kapatır / açar."""
+        if not self.acik:
+            return
+        self.sessiz = not self.sessiz
+        self.muzik_seviye_ayarla(self.muzik_seviye)
+        if self.sessiz:
+            for kanal_no in range(1, pygame.mixer.get_num_channels()):
+                pygame.mixer.Channel(kanal_no).stop()
+
+
+ses = Ses()
 
 
 # ----------------------------------------------------------------- yardımcı fonksiyonlar
@@ -298,6 +510,7 @@ class Esya:
                 oyun.oyuncu.enerji = min(100, oyun.oyuncu.enerji + 45)
                 oyun.yazi_ekle(self.konum, "+45 ENERJİ", TURKUAZ)
             oyun.halka_ekle(self.konum, self.renk, 40)
+            ses.cal("esya")
             return False
         return self.omur > 0
 
@@ -433,6 +646,7 @@ class Dusman:
                 for i in range(20):
                     oyun.dusman_ates_et(self.konum.copy(), self.zaman + i * math.tau / 20, 230, 9, MOR, 6)
                 oyun.halka_ekle(self.konum, PEMBE, 160)
+                ses.cal("halka")
             if evre >= 2:                                       # 2. evreden itibaren dron çağırır
                 self.cagri_bekleme -= gecen
                 if self.cagri_bekleme <= 0:
@@ -498,6 +712,7 @@ class Oyuncu:
         self.atilma_suresi, self.atilma_bekleme = 0.16, 1.1
         self.dokunulmazlik = max(self.dokunulmazlik, 0.28)
         oyun.halka_ekle(self.konum, TURKUAZ, 70)
+        ses.cal("dash", 0)
 
     def ates_et(self, oyun):
         """Seçili silahla ateş eder; enerji yetmiyorsa ateş etmez."""
@@ -506,6 +721,7 @@ class Oyuncu:
             return
         self.enerji -= maliyet
         self.ates_bekleme = aralik
+        ses.cal(("plazma", "sacma", "lazer")[self.silah], 0)
         temel_aci = math.atan2(self.nisan.y, self.nisan.x)
         namlu = self.konum + self.nisan * 22               # mermi çıkış noktası
         sarsinti = 1.0
@@ -574,6 +790,7 @@ class Oyun:
             self.rekor = 0
         self.durum, self.zaman, self.goruntu_kopya, self.kamera = "menu", 0.0, None, Vek(0, 0)
         # durum: "menu" | "oyun" | "duraklat" | "bitti" | "kazandi"
+        self.ses_durumu = None                                     # müzik seviyesi en son hangi durum için ayarlandı
         self.sifirla()
 
     def sifirla(self):
@@ -604,13 +821,14 @@ class Oyun:
         self.afis = (metin, sure, renk)
 
     def patlat(self, konum, renk, adet=30, hiz=320):
-        """Parçacık + halka + ekran sarsıntısı ile patlama efekti."""
+        """Parçacık + halka + ekran sarsıntısı + ses ile patlama efekti."""
         for _ in range(adet):
             aci, ivme = random.uniform(0, math.tau), random.uniform(40, hiz)
             self.parcaciklar.append(Parcacik(konum, Vek(math.cos(aci), math.sin(aci)) * ivme, renk,
                                              random.uniform(0.3, 0.9), random.uniform(7, 15)))
         self.halka_ekle(konum, renk, 50 + adet)
         self.sarsinti = max(self.sarsinti, min(16, adet / 3))
+        ses.cal("buyuk_patlama" if adet >= 40 else "patlama")
 
     def gorus_hatti_var_mi(self, a, b):
         """a ile b arasında duvar yoksa True (düşman ancak görüyorsa ateş eder)."""
@@ -620,6 +838,7 @@ class Oyun:
 
     def dusman_ates_et(self, konum, aci, hiz, hasar, renk, yaricap=5):
         """Düşman mermisi oluşturur."""
+        ses.cal("dusman_ates")
         self.mermiler.append(Mermi(konum, Vek(math.cos(aci), math.sin(aci)) * hiz, hasar, False, renk, 4.0, yaricap))
 
     def sokak_noktasi(self, en_az_uzaklik=700, yakin=None):
@@ -658,6 +877,7 @@ class Oyun:
         oyuncu.dokunulmazlik = 0.3
         self.sarsinti = max(self.sarsinti, 10)
         self.hasar_efekti = 0.4
+        ses.cal("hasar")
         for _ in range(10):
             self.parcaciklar.append(Parcacik(oyuncu.konum, Vek(random.uniform(-200, 200), random.uniform(-200, 200)), KIRMIZI, 0.5, 9))
         if oyuncu.can <= 0:
@@ -667,6 +887,7 @@ class Oyun:
         """Oyunu 'bitti' ya da 'kazandi' durumuna alır ve rekoru kaydeder."""
         self.durum = durum
         self.goruntu_kopya = None
+        ses.cal("zafer" if durum == "kazandi" else "yenilgi", 0)
         if self.skor > self.rekor:
             self.rekor = self.skor
             try:
@@ -702,10 +923,12 @@ class Oyun:
         self.gorev += 1
         self.gorev_oldurme = 0
         self.afis_ayarla(f"GÖREV {self.gorev} TAMAMLANDI", YESIL)
+        ses.cal("gorev", 0)
         if self.gorev == 3:                                # son görev: patron doğar
             self.dusmanlar.clear()
             self.dusmanlar.append(Dusman("patron", Vek(2100, 900), True))
             self.afis_ayarla("ANA ÇEKİRDEK UYANDI!", PEMBE, 3.5)
+            ses.cal("patron_uyan", 0)
             self.sarsinti = 14
 
     def hedef_konum(self):
@@ -724,6 +947,7 @@ class Oyun:
         """Menüden oyunu başlatır."""
         self.sifirla()
         self.durum, self.goruntu_kopya = "oyun", None
+        ses.cal("baslat", 0)
         self.afis_ayarla("GÖREV 1: " + GOREVLER[0], TURKUAZ, 3.5)
 
     def olay_isle(self, olay):
@@ -734,6 +958,9 @@ class Oyun:
         durum = self.durum
         if olay.type == pygame.KEYDOWN:
             tus = olay.key
+            if tus == pygame.K_n:                              # N: sesi aç / kapat (her ekranda çalışır)
+                ses.sesi_ac_kapat()
+                return
             if durum == "menu":
                 if tus in (pygame.K_RETURN, pygame.K_SPACE):
                     self.baslat()
@@ -743,15 +970,19 @@ class Oyun:
             elif durum == "oyun":
                 if tus in (pygame.K_ESCAPE, pygame.K_p):
                     self.durum, self.goruntu_kopya = "duraklat", None
+                    ses.cal("duraklat", 0)
                 elif tus == pygame.K_SPACE:
                     self.oyuncu.atilma(self)
                 elif tus in (pygame.K_1, pygame.K_2, pygame.K_3):
                     self.oyuncu.silah = tus - pygame.K_1
+                    ses.cal("silah")
                 elif tus == pygame.K_TAB:
                     self.oyuncu.silah = (self.oyuncu.silah + 1) % 3
+                    ses.cal("silah")
             elif durum == "duraklat":
                 if tus in (pygame.K_ESCAPE, pygame.K_p):
                     self.durum = "oyun"
+                    ses.cal("duraklat", 0)
                 elif tus == pygame.K_q:
                     self.durum = "menu"
             elif durum in ("bitti", "kazandi"):
@@ -763,6 +994,7 @@ class Oyun:
             self.baslat()
         elif olay.type == pygame.MOUSEWHEEL and durum == "oyun":
             self.oyuncu.silah = (self.oyuncu.silah - olay.y) % 3
+            ses.cal("silah")
 
     # --- mantık güncellemesi
     def guncelle(self, gecen):
@@ -780,12 +1012,14 @@ class Oyun:
             hacklenen_terminal = next((t for t in self.terminaller if t.yakin and not t.bitti), None)
         for terminal in self.terminaller:
             if terminal is hacklenen_terminal:
+                ses.cal("hackle")                                 # hackleme sürerken bip bip sesi
                 terminal.ilerleme += gecen / 3.0                  # 3 saniyede tamamlanır
                 if random.random() < 0.5:
                     self.parcaciklar.append(Parcacik(terminal.konum, Vek(random.uniform(-80, 80), random.uniform(-80, 80)), SARI, 0.4, 6))
                 if terminal.ilerleme >= 1:
                     terminal.bitti = True
                     self.hacklenen += 1
+                    ses.cal("terminal_tamam", 0)
                     self.skor += 200
                     self.patlat(terminal.konum, YESIL, 30)
                     self.afis_ayarla(f"TERMİNAL HACKLENDİ  {self.hacklenen}/3", YESIL, 2.2)
@@ -834,6 +1068,7 @@ class Oyun:
                 vurulan = next((d for d in self.dusmanlar if (d.konum - mermi.konum).length() < d.yaricap + mermi.yaricap), None)
                 if vurulan:
                     vurulan.hasar_al(mermi.hasar)
+                    ses.cal("vurus")
                     for _ in range(3):
                         self.parcaciklar.append(Parcacik(mermi.konum, Vek(random.uniform(-150, 150), random.uniform(-150, 150)), mermi.renk, 0.3, 6))
                     continue
@@ -953,6 +1188,8 @@ class Oyun:
         yazi_yaz(yazi_o, GOREVLER[self.gorev] + ilerleme, BEYAZ, (GENISLIK // 2, 46), ortala=True)
         yazi_yaz(yazi_o, f"SKOR {self.skor}", BEYAZ, (GENISLIK - 250, 18))
         yazi_yaz(yazi_k, f"REKOR {self.rekor}", YESIL, (GENISLIK - 250, 46))
+        if ses.acik:                                              # sol altta ses durumu
+            yazi_yaz(yazi_k, "N : SES KAPALI" if ses.sessiz else "N : SES AÇIK", (110, 120, 160), (20, YUKSEKLIK - 28))
         patron = self.patron()
         if patron:
             bar_ciz((GENISLIK // 2 - 300, 78, 600, 14), patron.can / patron.maks_can, PEMBE)
@@ -999,7 +1236,7 @@ class Oyun:
         for i, satir in enumerate(hikaye):
             yazi_yaz(yazi_o, satir, BEYAZ, (GENISLIK // 2, 270 + i * 32), ortala=True)
         kontroller = ["WASD : hareket      FARE : nişan / ateş      SPACE : dash",
-                      "1-2-3 / tekerlek : silah      E (basılı) : hackle      ESC : duraklat"]
+                      "1-2-3 / tekerlek : silah      E (basılı) : hackle      ESC : duraklat      N : ses"]
         for i, satir in enumerate(kontroller):
             yazi_yaz(yazi_k, satir, (150, 170, 210), (GENISLIK // 2, 410 + i * 26), ortala=True)
         saydamlik = int(140 + 115 * math.sin(self.zaman * 4))     # yanıp sönen başlat yazısı
@@ -1022,6 +1259,10 @@ class Oyun:
 
     def adim(self, gecen):
         """Ana döngünün her karede çağırdığı fonksiyon: duruma göre günceller ve çizer."""
+        if self.durum != self.ses_durumu:                         # durum değişince müziğin sesini ona göre ayarla
+            self.ses_durumu = self.durum
+            ses.muzik_seviye_ayarla({"menu": 0.30, "oyun": 0.35, "duraklat": 0.12,
+                                     "bitti": 0.10, "kazandi": 0.15}[self.durum])
         if self.durum == "oyun":
             self.guncelle(gecen)
         if self.durum == "oyun":
@@ -1051,6 +1292,7 @@ class Oyun:
 def ana():
     """Programın giriş noktası: oyun döngüsünü çalıştırır."""
     oyun = Oyun()
+    ses.muzik_baslat()
     while True:
         gecen = min(saat.tick(KARE_HIZI) / 1000, 0.033)           # önceki kareden beri geçen süre (sn)
         for olay in pygame.event.get():

@@ -1,0 +1,15 @@
+{
+  "sevo": {
+    "dil": "tr",
+    "tema": "varsayilan",
+    "ses": true,
+    "animasyon": true,
+    "fps": false,
+    "avatar": 5,
+    "tuslar": {}
+  },
+  "_genel": {
+    "dil": "tr",
+    "tema": "varsayilan"
+  }
+}
